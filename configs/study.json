@@ -1,0 +1,10 @@
+{
+  "seeds": [42, 43, 44, 45, 46, 47, 48, 49, 50, 51],
+  "batch_size": 384,
+  "steps": 20,
+  "alpha": 0.05,
+  "gate_level": 0.32,
+  "trim_rate": 0.15,
+  "scenarios": {"stationary": 0.05, "gradual": 0.05, "sudden": 0.05, "sudden_burst": 0.25},
+  "models": ["iforest", "lof", "ocsvm", "ae", "vae", "ensemble"]
+}

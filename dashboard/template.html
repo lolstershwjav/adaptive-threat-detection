@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Adaptive Threat Detection · Replay Explorer</title>
+<style>
+:root{color-scheme:dark;font:16px system-ui,sans-serif;background:#0b121a;color:#e2ecf7}
+*{box-sizing:border-box}body{margin:0}main{max-width:1180px;margin:auto;padding:52px 28px}
+h1{font-size:clamp(2.2rem,5vw,3.75rem);letter-spacing:-.055em;margin:0}
+header p{color:#9db0c6;margin:8px 0 30px}
+.controls,.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+label,dt{color:#a6b9cb;font-size:.87rem}
+select{display:block;width:100%;margin-top:6px;padding:10px;border:1px solid #31455d;
+  border-radius:7px;background:#111e2b;color:#eef6ff;font:inherit}
+.cards{margin:22px 0 12px}.card,section{background:#111d29;border:1px solid #23364a;border-radius:12px}
+.card{padding:14px}dd{font-size:1.5rem;font-variant-numeric:tabular-nums;margin:4px 0 0}
+section{margin:12px 0;padding:20px;overflow:auto}h2{font-size:1rem;margin:0 0 10px}
+.legend{color:#a6b9cb;font-size:.85rem;line-height:1.7}
+canvas{display:block;width:100%;height:260px;touch-action:pan-y}
+table{width:100%;border-collapse:collapse;text-align:right;font-variant-numeric:tabular-nums}
+th,td{padding:9px;border-bottom:1px solid #23364a;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}tbody tr:hover,tbody tr.active{background:#1a3144}
+#detail{min-height:1.5em;color:#c7d9ea;font-size:.92rem}
+.note{color:#a6b9cb;font-size:.91rem}
+@media(max-width:650px){main{padding:28px 15px}.controls,.cards{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body><main>
+<header><h1>Replay Explorer</h1><p>Adaptive unsupervised threat detection</p></header>
+<div class="controls">
+<label>Scenario<select id="scenario"></select></label>
+<label>Model<select id="model"></select></label>
+<label>Policy<select id="policy"></select></label>
+<label>Seed<select id="seed"></select></label>
+</div>
+<dl class="cards">
+<div class="card"><dt>False positives</dt><dd id="fpr"></dd></div>
+<div class="card"><dt>Attack recall</dt><dd id="recall"></dd></div>
+<div class="card"><dt>Average precision</dt><dd id="ap"></dd></div>
+<div class="card"><dt>Update batches</dt><dd id="updates"></dd></div>
+</dl>
+<section><h2>Score and threshold</h2>
+<div class="legend">Median <span style="color:#84afff">●</span> · 95th percentile <span style="color:#66e8be">●</span> · Threshold <span style="color:#ffd587">●</span> · Refit or recalibration <span style="color:#df9af9">│</span></div>
+<canvas id="scores" role="img" aria-label="Anomaly scores and threshold by batch"></canvas>
+</section>
+<section><h2>Alert distribution</h2>
+<div class="legend">True alerts <span style="color:#66e8be">■</span> · False alerts <span style="color:#fb9b92">■</span> · Total labeled anomalies <span style="color:#84afff">●</span></div>
+<canvas id="alerts" role="img" aria-label="True and false alerts and ground truth anomalies by batch"></canvas>
+<p id="detail" aria-live="polite">Hover over either chart to inspect a batch.</p>
+</section>
+<section><h2>Batch evidence</h2>
+<table><thead><tr><th>Batch</th><th>Score p95</th><th>Threshold</th><th>False positives</th><th>Recall</th>
+<th>Alerts</th><th>Drift signal</th><th>Updated</th></tr></thead><tbody id="batches"></tbody></table>
+</section>
+<p class="note" id="description"></p>
+</main>
+<script type="application/json" id="data">__REPLAY_DATA__</script>
+<script>
+const runs = JSON.parse(document.querySelector('#data').textContent)
+const dimensions = ['scenario','model','policy','seed']
+const select = Object.fromEntries(dimensions.map(key => [key, document.getElementById(key)]))
+const labels = { unsw:'UNSW-NB15 benchmark', sudden:'Sudden drift', gradual:'Gradual drift',
+  stationary:'Stationary', sudden_burst:'Sudden drift and contamination',
+  iforest:'Isolation Forest', ocsvm:'One-Class SVM', lof:'Local Outlier Factor',
+  ae:'Autoencoder', vae:'Variational autoencoder', ensemble:'Ensemble',
+  frozen:'Frozen', threshold:'Threshold only', rolling:'Rolling', rolling_trim:'Rolling + trimming',
+  gated:'Drift-gated', gated_trim:'Drift-gated + trimming', gated_fit_only:'Drift-gated fit only' }
+let current
+let highlighted = null
+const percent = v => v == null ? '—' : (100*v).toFixed(1)+'%'
+const fixed = v => v.toFixed(3)
+function render() {
+  let matches = runs
+  dimensions.forEach(key => {
+    const input = select[key], previous = input.value
+    const values = [...new Set(matches.map(run => String(run[key])))]
+    input.replaceChildren(...values.map(v => new Option(labels[v] || v,v)))
+    input.value = values.includes(previous) ? previous : values[0]
+    matches = matches.filter(run => String(run[key]) === input.value)
+  })
+  current = matches[0]
+  const {metrics, timeline} = current
+  Object.entries({fpr:percent(metrics.fpr), recall:percent(metrics.recall),
+    ap:percent(metrics.ap), updates:metrics.updates}).forEach(([id,v]) => document.getElementById(id).textContent = v)
+  document.getElementById('description').textContent = current.scenario === 'unsw' ?
+    'UNSW-NB15 is cyber-range flow data. This replay uses published partitions without timestamps.' :
+    'Controlled simulation. Labels are used to evaluate decisions after scoring each batch.'
+  const body = document.getElementById('batches')
+  body.replaceChildren(...timeline.map(row => {
+    const tr = document.createElement('tr')
+    const cells = [row.batch,fixed(row.p95_score),fixed(row.threshold),percent(row.fpr),
+      percent(row.recall),row.alerts,fixed(row.shift)+(row.trigger?' · signaled':''),row.updated?'Yes':'—']
+    cells.forEach(value => { const td = tr.insertCell(); td.textContent=value })
+    return tr
+  }))
+  inspect(null)
+}
+function draw(id, bar) {
+  const canvas = document.getElementById(id), ctx = canvas.getContext('2d')
+  const {clientWidth:w,clientHeight:h} = canvas, ratio = window.devicePixelRatio || 1
+  canvas.width = w*ratio
+  canvas.height = h*ratio
+  ctx.scale(ratio,ratio)
+  const rows = current.timeline, left=43, right=12, top=13, bottom=31
+  const step = (w-left-right)/rows.length
+  const x = i => left+(i+.5)*step
+  const low = bar ? 0 : Math.min(0,...rows.map(r => r.median_score))
+  const high = bar ? Math.max(1,...rows.map(r => Math.max(r.alerts,r.true_anomalies))) :
+    Math.max(1,...rows.map(r => Math.max(r.p95_score,r.threshold)))
+  const y = v => h-bottom-(v-low)/(high-low)*(h-top-bottom)
+  ctx.font='11px system-ui'
+  for(let j=0;j<=4;j++){
+    const value=low+(high-low)*j/4, yy=y(value)
+    ctx.fillStyle='#9db0c6'
+    ctx.fillText(bar?Math.round(value):value.toFixed(2),0,yy+4)
+    ctx.strokeStyle='#2a4057'
+    ctx.beginPath();ctx.moveTo(left,yy);ctx.lineTo(w-right,yy);ctx.stroke()
+  }
+  function line(field,color) {
+    ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath()
+    rows.forEach((r,i)=>i?ctx.lineTo(x(i),y(r[field])):ctx.moveTo(x(i),y(r[field])))
+    ctx.stroke()
+  }
+  rows.forEach((r,i)=>{
+    if (i%Math.ceil(rows.length/10)===0 || i===rows.length-1) {
+      ctx.fillStyle='#9db0c6';ctx.fillText(r.batch,x(i)-4,h-8)
+    }
+    if (bar) {
+      const hits=Math.round(r.precision*r.alerts)
+      const width=Math.max(2,step*.56)
+      ctx.fillStyle='#66e8be';ctx.fillRect(x(i)-width/2,y(hits),width,y(0)-y(hits))
+      ctx.fillStyle='#fb9b92';ctx.fillRect(x(i)-width/2,y(r.alerts),width,y(hits)-y(r.alerts))
+    } else if(r.updated){
+      ctx.strokeStyle='#ab72ba';ctx.lineWidth=1
+      ctx.beginPath();ctx.moveTo(x(i),top);ctx.lineTo(x(i),h-bottom);ctx.stroke()
+    }
+  })
+  if(bar) line('true_anomalies','#84afff')
+  else {line('median_score','#84afff');line('p95_score','#66e8be');line('threshold','#ffd587')}
+  if (highlighted!==null) {
+    ctx.strokeStyle='#e2ecf7';ctx.lineWidth=1
+    ctx.beginPath();ctx.moveTo(x(highlighted),top);ctx.lineTo(x(highlighted),h-bottom);ctx.stroke()
+  }
+}
+function inspect(index){
+  highlighted=index
+  const r=index===null?null:current.timeline[index]
+  document.getElementById('detail').textContent=r?
+    `Batch ${r.batch} · ${r.alerts} alerts · ${r.true_anomalies} labeled anomalies · shift ${fixed(r.shift)}`:
+    'Hover over either chart to inspect a batch.'
+  Array.from(document.querySelectorAll('tbody tr')).forEach((tr,i)=>tr.classList.toggle('active',i===index))
+  draw('scores',false);draw('alerts',true)
+}
+for(const input of Object.values(select)) input.addEventListener('change',render)
+for(const id of ['scores','alerts']){
+  const canvas=document.getElementById(id)
+  canvas.addEventListener('pointermove',event=>{
+    const i=Math.floor((event.offsetX-43)/(canvas.clientWidth-55)*current.timeline.length)
+    const next=i>=0&&i<current.timeline.length?i:null
+    if(next!==highlighted)inspect(next)
+  })
+  canvas.addEventListener('pointerleave',()=>inspect(null))
+}
+window.addEventListener('resize',()=>inspect(highlighted))
+select.scenario.append(new Option('Sudden drift','sudden'))
+select.policy.append(new Option('Drift-gated + trimming','gated_trim'))
+render()
+</script></body></html>
